@@ -76,25 +76,29 @@ def read_alpha(path: Path) -> np.ndarray:
 # --- Robust Video Matting -------------------------------------------------
 
 
-def run_rvm(take: Path, backbone: str, ratio: float, limit: int | None) -> None:
+def run_rvm(take: Path, backbone: str, ratio: float, limit: int | None, width: int = 0) -> None:
+    """width > 0 runs on the frame resized to that width (720p = 1280, as
+    the published Core ML model does), writing rvm-<backbone>-<width>."""
     sys.path.insert(0, str(CACHE / "src" / "rvm"))
     from model import MattingNetwork  # type: ignore
 
     dev = device()
     model = MattingNetwork(backbone).eval().to(dev)
     model.load_state_dict(torch.load(CACHE / "weights" / f"rvm_{backbone}.pth", map_location="cpu"))
-    writer = AlphaWriter(take / f"rvm-{backbone}.bin")
+    writer = AlphaWriter(take / (f"rvm-{backbone}-{width}.bin" if width else f"rvm-{backbone}.bin"))
     rec = [None] * 4
     spent = []
     with torch.no_grad():
         for _, rgb in frames(take, limit):
+            if width:
+                rgb = np.asarray(Image.fromarray(rgb).resize((width, width * 9 // 16), Image.BILINEAR))
             src = torch.from_numpy(rgb).to(dev).permute(2, 0, 1)[None].float() / 255
             start = time.perf_counter()
             _, pha, *rec = model(src, *rec, downsample_ratio=ratio)
             alpha = (pha[0, 0].clamp(0, 1) * 255).byte().cpu().numpy()
             spent.append(time.perf_counter() - start)
             # Kept at half size: plenty to judge edges, a quarter of the disk.
-            writer.write(alpha[::2, ::2])
+            writer.write(alpha if width else alpha[::2, ::2])
     writer.close()
     print(f"rvm-{backbone}: {writer.count} frames, mean {np.mean(spent) * 1000:.1f} ms "
           f"(MPS, incl. readback; not a deployment figure)")
@@ -118,7 +122,7 @@ def seated_frames(spec: str, count: int) -> np.ndarray:
 def run_matanyone(take: Path, seed: str, size: tuple[int, int], limit: int | None,
                   reseed: int = 0, objects: list[str] | None = None,
                   chair: str = "", seated: str = "none", tag: str = "",
-                  gate: str = "") -> None:
+                  gate: str = "", crop: str = "") -> None:
     """Mirrors the reference inference_matanyone2.py loop: the seed mask
     (0-255) dilated then eroded by 10, and the first frame repeated 10
     times as warm-up before the take plays.
@@ -145,9 +149,27 @@ def run_matanyone(take: Path, seed: str, size: tuple[int, int], limit: int | Non
 
     gate_seeds = read_alpha(take / f"{gate}.bin") if gate else None
 
+    # Crop: the model sees only a box around the subject, so its working
+    # pixels land on the person. "auto" is the union of the gate (or seed)
+    # person masks over the take, widened 6% a side, full height; a live
+    # version would follow a running window instead.
+    box = (0.0, 0.0, 1.0, 1.0)
+    if crop == "auto":
+        union = np.asarray(gate_seeds if gate_seeds is not None else seeds).max(axis=0) > 127
+        cols = np.where(union.any(axis=0))[0] / union.shape[1]
+        box = (max(0.0, cols[0] - 0.06), 0.0, min(1.0, cols[-1] + 0.06), 1.0)
+        print(f"crop box (normalized, original orientation): {tuple(round(v, 3) for v in box)}")
+
+    def view(a: np.ndarray) -> np.ndarray:
+        a = np.asarray(a)
+        ah, aw = a.shape[:2]
+        x0, y0, x1, y1 = (int(round(box[0] * aw)), int(round(box[1] * ah)),
+                          int(round(box[2] * aw)), int(round(box[3] * ah)))
+        return np.array(Image.fromarray(a[y0:y1, x0:x1]).resize((w, h), Image.BILINEAR))
+
     def target(index: int, person=None) -> torch.Tensor:
         def fit(a: np.ndarray) -> np.ndarray:
-            return np.array(Image.fromarray(np.asarray(a)).resize((w, h), Image.BILINEAR)) > 127
+            return view(a) > 127
 
         keep = fit((seeds if person is None else person)[index])
         for t in tracks:
@@ -159,7 +181,7 @@ def run_matanyone(take: Path, seed: str, size: tuple[int, int], limit: int | Non
         return torch.from_numpy(mask).float().to(dev)
 
     def fit_track(a: np.ndarray) -> np.ndarray:
-        return np.array(Image.fromarray(np.asarray(a)).resize((w, h), Image.BILINEAR)) > 127
+        return view(a) > 127
 
     def allowed_region(index: int, person=None) -> torch.Tensor:
         """Where the matte may be non-zero: the target grown by a margin
@@ -176,13 +198,13 @@ def run_matanyone(take: Path, seed: str, size: tuple[int, int], limit: int | Non
             keep |= fit_track(chair_track[index])
         return torch.from_numpy(keep.astype(np.float32)).to(dev)
 
-    name = f"matanyone-{w}x{h}-{seed}" + (f"-{tag}" if tag else "")
+    name = f"matanyone-{w}x{h}-{seed}" + ("-crop" if crop else "") + (f"-{tag}" if tag else "")
     writer = AlphaWriter(take / f"{name}.bin")
     spent = []
     warmup = 10
 
     def to_input(rgb: np.ndarray) -> torch.Tensor:
-        small = np.array(Image.fromarray(rgb).resize((w, h), Image.BILINEAR))
+        small = view(rgb)
         return torch.from_numpy(small).permute(2, 0, 1).float().to(dev) / 255
 
     with torch.no_grad():
@@ -218,6 +240,13 @@ def run_matanyone(take: Path, seed: str, size: tuple[int, int], limit: int | Non
                                       (forced_region(index) > 0).float())
             out = (alpha.clamp(0, 1) * 255).byte().cpu().numpy()
             spent.append(time.perf_counter() - start)
+            if crop:
+                # Back into a full frame (1920x1080) so it compares 1:1.
+                full = np.zeros((1080, 1920), dtype=np.uint8)
+                x0, x1 = int(round(box[0] * 1920)), int(round(box[2] * 1920))
+                y0, y1 = int(round(box[1] * 1080)), int(round(box[3] * 1080))
+                full[y0:y1, x0:x1] = np.array(Image.fromarray(out).resize((x1 - x0, y1 - y0), Image.BILINEAR))
+                out = full
             writer.write(out)
     writer.close()
     print(f"{name}: {writer.count} frames, "
@@ -281,6 +310,7 @@ def main() -> None:
     p.add_argument("take", type=Path)
     p.add_argument("--backbone", default="mobilenetv3")
     p.add_argument("--ratio", type=float, default=0.125)
+    p.add_argument("--width", type=int, default=0)
     p.add_argument("--limit", type=int)
     p = sub.add_parser("matanyone")
     p.add_argument("take", type=Path)
@@ -293,6 +323,7 @@ def main() -> None:
     p.add_argument("--seated", default="none")
     p.add_argument("--tag", default="")
     p.add_argument("--gate", default="", help="person mask stream applied to every frame")
+    p.add_argument("--crop", default="", help="'auto': run on a box around the subject")
     p = sub.add_parser("sheet")
     p.add_argument("take", type=Path)
     p.add_argument("methods", nargs="+")
@@ -301,12 +332,12 @@ def main() -> None:
     p.add_argument("--out", type=Path)
     args = parser.parse_args()
     if args.cmd == "rvm":
-        run_rvm(args.take, args.backbone, args.ratio, args.limit)
+        run_rvm(args.take, args.backbone, args.ratio, args.limit, args.width)
     elif args.cmd == "matanyone":
         w, h = (int(v) for v in args.size.split("x"))
         run_matanyone(args.take, args.seed, (w, h), args.limit, args.reseed,
                       [o for o in args.objects.split(",") if o], args.chair,
-                      args.seated, args.tag, args.gate)
+                      args.seated, args.tag, args.gate, args.crop)
     else:
         sheet(args.take, args.methods, args.frames, args.out or args.take.parent.parent / "sheets", args.at)
 
