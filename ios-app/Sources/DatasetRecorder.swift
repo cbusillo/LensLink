@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreMotion
 
 /// Offline test-set recorder (this fork): saves what the green screen sees
 /// so cutout ideas can be tried on the Mac without rebuilding the app.
@@ -9,6 +10,12 @@ import AVFoundation
 ///    nanoseconds, the wire clock), width u32, height u32, bytesPerRow
 ///    u32, then height×bytesPerRow bytes of DepthFloat16 metres; all
 ///    little-endian;
+///  - frames.bin: each written video frame's original pts (u64
+///    nanoseconds, little-endian), in file order — video.mov's own
+///    timeline starts at zero, so this is what pairs frames with depth;
+///  - motion.bin: device motion at 30 Hz — per record: timestamp (f64
+///    seconds, the same host clock), gravity x/y/z and attitude
+///    quaternion x/y/z/w (f64 each);
 ///  - calibration.json: intrinsics and their reference size, once.
 ///
 /// Started and stopped by the `record_dataset` CONTROL command. Appends
@@ -25,6 +32,10 @@ final class DatasetRecorder {
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
     private var depthHandle: FileHandle?
+    private var framesHandle: FileHandle?
+    private var motionHandle: FileHandle?
+    private let motion = CMMotionManager()
+    private let motionQueue = OperationQueue()
     private var wroteCalibration = false
     private var stopAt: CFAbsoluteTime = 0
     private var frames = 0
@@ -51,11 +62,9 @@ final class DatasetRecorder {
             do {
                 try FileManager.default.createDirectory(
                     at: dir, withIntermediateDirectories: true)
-                FileManager.default.createFile(
-                    atPath: dir.appendingPathComponent("depth.bin").path,
-                    contents: nil)
-                depthHandle = try FileHandle(
-                    forWritingTo: dir.appendingPathComponent("depth.bin"))
+                depthHandle = try Self.newFile(dir, "depth.bin")
+                framesHandle = try Self.newFile(dir, "frames.bin")
+                motionHandle = try Self.newFile(dir, "motion.bin")
                 writer = try AVAssetWriter(
                     outputURL: dir.appendingPathComponent("video.mov"),
                     fileType: .mov)
@@ -70,6 +79,7 @@ final class DatasetRecorder {
             depthMaps = 0
             stopAt = CFAbsoluteTimeGetCurrent() + max(1, min(seconds, 600))
             setActive(true)
+            startMotion()
             print("DatasetRecorder: recording \(dir.lastPathComponent)")
         }
     }
@@ -116,7 +126,12 @@ final class DatasetRecorder {
                     CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             }
             guard let input, input.isReadyForMoreMediaData else { return }
-            if input.append(sampleBuffer) { frames += 1 }
+            if input.append(sampleBuffer) {
+                frames += 1
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                let ns = UInt64(max(0, CMTimeGetSeconds(pts)) * 1_000_000_000)
+                withUnsafeBytes(of: ns.littleEndian) { framesHandle?.write(Data($0)) }
+            }
         }
     }
 
@@ -163,8 +178,13 @@ final class DatasetRecorder {
     private func finish() {
         guard isRecording else { return }
         setActive(false)
+        motion.stopDeviceMotionUpdates()
         try? depthHandle?.close()
+        try? framesHandle?.close()
+        try? motionHandle?.close()
         depthHandle = nil
+        framesHandle = nil
+        motionHandle = nil
         let name = folder?.lastPathComponent ?? "?"
         let counts = "\(frames) frames, \(depthMaps) depth maps"
         if let writer, writer.status == .writing {
@@ -178,6 +198,32 @@ final class DatasetRecorder {
         writer = nil
         input = nil
         folder = nil
+    }
+
+    private static func newFile(_ dir: URL, _ name: String) throws -> FileHandle {
+        let url = dir.appendingPathComponent(name)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        return try FileHandle(forWritingTo: url)
+    }
+
+    private func startMotion() {
+        guard motion.isDeviceMotionAvailable else { return }
+        motion.deviceMotionUpdateInterval = 1.0 / 30
+        motionQueue.maxConcurrentOperationCount = 1
+        motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] sample, _ in
+            guard let self, let sample else { return }
+            let g = sample.gravity, q = sample.attitude.quaternion
+            var record = Data(capacity: 64)
+            for value in [sample.timestamp, g.x, g.y, g.z, q.x, q.y, q.z, q.w] {
+                withUnsafeBytes(of: value.bitPattern.littleEndian) {
+                    record.append(contentsOf: $0)
+                }
+            }
+            self.queue.async {
+                guard self.isRecording else { return }
+                self.motionHandle?.write(record)
+            }
+        }
     }
 
     private func writeCalibration(_ calibration: AVCameraCalibrationData,
