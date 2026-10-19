@@ -10,6 +10,11 @@ them on the same frames before building anything live. This fork only.
 - `lab.py rvm|matanyone|sheet`: Robust Video Matting, MatAnyone2 (reference
   PyTorch on MPS, seeded by a Vision mask) and side-by-side review sheets.
 - `crops.py`: 1:1 crops of both hair edges for each method at one frame.
+- `sam_tracks.py`: SAM 2 object tracks (mic, chair) from click points; a lab
+  stand-in for automatic detection.
+- `video.py`: side-by-side review video of methods.
+- `lab.py matanyone --reseed --objects --chair --seated --gate`: the keep/drop
+  rules: memory corrected every N frames and the output gated every frame.
 
 Model source and weights are not vendored; `lab.py` expects them under
 `/Volumes/Developer-Artifacts/host-caches/matte-lab` (`src/rvm`,
