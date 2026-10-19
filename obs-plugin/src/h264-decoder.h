@@ -37,6 +37,12 @@ void h264_decoder_set_frame_sink(struct h264_decoder *dec,
 				 void (*sink)(void *ud, struct AVFrame *frame),
 				 void *ud);
 
+/* Standard path only: attach alpha mattes from `matte` (matte.h) to the
+ * frames pushed via obs_source_output_video. NULL detaches. */
+struct lenslink_matte;
+void h264_decoder_set_matte(struct h264_decoder *dec,
+			    struct lenslink_matte *matte);
+
 /* Whether this instance actually decodes on the GPU. */
 bool h264_decoder_is_hw(const struct h264_decoder *dec);
 

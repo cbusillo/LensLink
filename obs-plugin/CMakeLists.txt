@@ -66,6 +66,7 @@ add_library(${PROJECT_NAME} MODULE
   src/plugin-settings.c
   src/gpu-frame.c
   src/pipeline-bench.c
+  src/matte.c
   src/json-reader.c
   src/handshake.c
   src/protocol.h
@@ -81,6 +82,9 @@ add_library(${PROJECT_NAME} MODULE
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE OBS::libobs ${FFMPEG_TARGET})
+# Alpha mattes arrive deflated (matte.c).
+find_package(ZLIB REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE ZLIB::ZLIB)
 target_compile_definitions(${PROJECT_NAME}
                            PRIVATE LENSLINK_VERSION="${LENSLINK_VERSION}")
 

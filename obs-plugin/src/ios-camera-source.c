@@ -43,6 +43,7 @@
 #include "plugin-settings.h"
 #include "gpu-frame.h"
 #include "pipeline-bench.h"
+#include "matte.h"
 
 #include <libavutil/frame.h>
 
@@ -152,6 +153,9 @@ struct ios_camera_source {
 	 * green picture is this feature working correctly far more often
 	 * than it is a fault, so the status has to say when it is on. */
 	volatile bool green_screen;
+	/* The auto-added chroma key was turned off by us because mattes
+	 * are flowing (matte_chroma_key) — only then do we turn it back. */
+	bool chroma_off_for_matte;
 	/* The stream is held, not broken: the phone is connected and its
 	 * camera is running, but no video is going out — the operator
 	 * paused it, or iOS interrupted capture (another app took the
@@ -719,6 +723,10 @@ struct client_state {
 	 * (so the file joins clean, like the decoder does). */
 	FILE *dump_file;
 	bool dump_tried; /* fopen failed once — don't retry per packet */
+
+	/* Alpha mattes for this connection (matte.h), created on the first
+	 * MATTE packet. */
+	struct lenslink_matte *matte;
 };
 
 static void send_buf_free(struct send_buf *b)
@@ -993,6 +1001,34 @@ static void ensure_chroma_key_filter(struct ios_camera_source *s)
 	}
 	obs_data_release(fs);
 	obs_data_release(settings);
+}
+
+/*
+ * While mattes flow the picture is the real background, not green, so the
+ * auto-added chroma key must not run on it: turn it off for that time and
+ * back on afterwards — only when we were the ones who turned it off, so a
+ * user's own choice is never overridden. Dial-loop thread, like
+ * ensure_chroma_key_filter.
+ */
+static void matte_chroma_key(struct ios_camera_source *s, bool matte)
+{
+	if (matte == s->chroma_off_for_matte)
+		return;
+	obs_source_t *filter = obs_source_get_filter_by_name(
+		s->source, CHROMA_KEY_FILTER_NAME);
+	if (matte) {
+		if (filter && obs_source_enabled(filter)) {
+			obs_source_set_enabled(filter, false);
+			s->chroma_off_for_matte = true;
+			blog(LOG_INFO, "[lenslink] alpha matte active — "
+				       "chroma-key filter turned off");
+		}
+	} else {
+		if (filter)
+			obs_source_set_enabled(filter, true);
+		s->chroma_off_for_matte = false;
+	}
+	obs_source_release(filter);
 }
 
 static int cmp_i64(const void *a, const void *b)
@@ -1817,6 +1853,8 @@ static void client_disconnect(struct ios_camera_source *s,
 	send_buf_free(&c->out);
 	h264_decoder_destroy(c->decoder);
 	c->decoder = NULL;
+	matte_destroy(c->matte);
+	c->matte = NULL;
 	c->name[0] = 0;
 
 	/* Clear the last frame so the source goes blank when the phone
@@ -2009,6 +2047,16 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 		if (cfg.has_kind)
 			c->is_screen = cfg.is_screen;
 
+		/* This fork applies alpha mattes: ask a camera stream for them
+		 * whenever it (re)starts — the app only takes green_screen
+		 * commands while streaming. It keeps the request for the
+		 * connection and sends mattes in place of painting green
+		 * whenever green screen is on; an app without the feature
+		 * ignores the field. */
+		if (!c->is_screen && !s->is_screen_source)
+			send_control_cmd(c,
+					 "{\"cmd\":\"green_screen\",\"matte\":true}");
+
 		/* Video config means the stream is (re)starting — a standby
 		 * connection has left standby. (A remote start also re-sends
 		 * HELLO, but don't rely on it.) */
@@ -2130,6 +2178,7 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 					? c->codec_id
 					: AV_CODEC_ID_H264,
 				s->hw_decode, c->hw_retry);
+			h264_decoder_set_matte(c->decoder, c->matte);
 			/* GPU pipeline: frames come out as AVFrames for the
 			 * render thread instead of obs_source_output_video.
 			 * Set before the first decode (macOS picks its BGRA
@@ -2271,6 +2320,8 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 		size_t raw_len = hdr->payload_size;
 		bool green_screen =
 			extract_json_bool_n(raw, raw_len, "greenScreen");
+		bool matte =
+			extract_json_bool_n(raw, raw_len, "greenScreenMatte");
 		/* Held rather than ended: the phone keeps the connection but
 		 * stops sending video, so the absence of frames is a state to
 		 * show, not a stall to diagnose. */
@@ -2303,7 +2354,8 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 				   c->name[0] ? c->name
 					      : T_("Status.UnknownDevice"),
 				   green_screen_suffix(s), paused_suffix(s));
-		if (green_screen && !ten_bit && !s->is_screen_source)
+		matte_chroma_key(s, green_screen && matte);
+		if (green_screen && !matte && !ten_bit && !s->is_screen_source)
 			ensure_chroma_key_filter(s);
 		break;
 	}
@@ -2398,6 +2450,14 @@ static bool handle_packet(struct ios_camera_source *s, struct client_state *c,
 			s->cal_reset_requested = true;
 		break;
 	}
+	case OBSC_PKT_MATTE:
+		if (!c->matte)
+			c->matte = matte_create();
+		matte_push(c->matte, hdr->pts_ns, payload, hdr->payload_size);
+		/* Decoders come and go (fallbacks, codec switches); point the
+		 * current one at this connection's mattes. */
+		h264_decoder_set_matte(c->decoder, c->matte);
+		break;
 	default:
 		blog(LOG_WARNING, "[lenslink] unknown packet type %d",
 		     hdr->type);

@@ -581,6 +581,22 @@ final class StreamClient {
     /// smear. Skip them until a fresh keyframe restarts the chain.
     private var waitingForKeyframe = false
 
+    /// Capture queue → network queue. A matte rides the video's
+    /// backpressure: while video frames are being shed it is dropped
+    /// too (its frame is likely gone, and the plugin shows an unmatched
+    /// frame opaque), so it never adds to a backlog.
+    func sendMatte(_ payload: Data, ptsNanoseconds: UInt64) {
+        queue.async { [weak self] in
+            guard let self, self.connection != nil,
+                  self.inFlightFrames < Self.maxInFlightFrames,
+                  !self.waitingForKeyframe else { return }
+            self.sendOnQueue(OBSCProtocol.packet(type: .matte,
+                                                 ptsNanoseconds: ptsNanoseconds,
+                                                 payload: payload),
+                             isVideoFrame: false)
+        }
+    }
+
     func sendVideoFrame(_ frame: VideoEncoder.EncodedFrame) {
         queue.async { [weak self] in
             guard let self, self.connection != nil else { return }

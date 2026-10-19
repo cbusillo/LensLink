@@ -48,6 +48,12 @@ enum OBSCProtocol {
         /// backwards-compatible; an old plugin logs an unknown-type warning
         /// and carries on.
         case request = 12
+        /// Alpha matte, app → plugin (this fork): the green screen's
+        /// keep-mask for the VIDEO frame with the same pts, sent only
+        /// after the plugin asks with `green_screen` `matte: true`.
+        /// Payload: width u16, height u16, encoding u8 (0 raw, 1 raw
+        /// deflate), reserved u8, then width×height alpha bytes.
+        case matte = 13
     }
 
     /// What a connection is streaming, sent in the HELLO / video config.

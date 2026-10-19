@@ -17,6 +17,10 @@ lenslink_test(protocol)
 lenslink_test(json-reader ${_src}/json-reader.c)
 lenslink_test(handshake ${_src}/handshake.c ${_src}/json-reader.c)
 lenslink_test(still ${_src}/still.c)
+lenslink_test(matte ${_src}/matte.c)
+target_include_directories(test-matte BEFORE PRIVATE stubs)
+find_package(ZLIB REQUIRED)
+target_link_libraries(test-matte PRIVATE ZLIB::ZLIB)
 
 # Fuzz harnesses for the parsers of untrusted input (tests/fuzz/). By
 # default each runs under a deterministic mutation driver as an ordinary

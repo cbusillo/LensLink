@@ -10,6 +10,7 @@
 #include <util/platform.h>
 
 #include "pipeline-bench.h"
+#include "matte.h"
 #include "still.h"
 
 #include <stdlib.h>
@@ -32,6 +33,8 @@ struct h264_decoder {
 	void (*frame_sink)(void *ud, AVFrame *frame);
 	void *frame_sink_ud;
 	bool gpu_frames; /* set at create; affects macOS surface format */
+
+	struct lenslink_matte *matte; /* not owned */
 
 	bool want_still;
 	uint8_t *still;
@@ -149,6 +152,13 @@ static bool try_init_hw(struct h264_decoder *dec, const AVCodec *codec,
 	}
 
 	return false;
+}
+
+void h264_decoder_set_matte(struct h264_decoder *dec,
+			    struct lenslink_matte *matte)
+{
+	if (dec)
+		dec->matte = matte;
 }
 
 void h264_decoder_set_frame_sink(struct h264_decoder *dec,
@@ -522,6 +532,7 @@ bool h264_decoder_decode(struct h264_decoder *dec, obs_source_t *source,
 					? (uint64_t)out_frame->pts
 					: os_gettime_ns();
 
+		matte_apply(dec->matte, &out);
 		obs_source_output_video(source, &out);
 
 		/* Benchmark: the standard pipeline's per-frame cost is the

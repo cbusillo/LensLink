@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Compression
 import Metal
 import Vision
 
@@ -8,6 +9,13 @@ import Vision
 /// everything else chroma green in one Metal compute pass, so the wire
 /// carries ordinary video and OBS chroma-keys it exactly like a physical
 /// green screen.
+///
+/// Alpha-matte mode (this fork): when the plugin asks for it, the frame
+/// goes to the encoder untouched and a small matte travels beside it
+/// as a MATTE packet (docs/PROTOCOL.md §13). The matte keeps the person
+/// mask inside the depth cutoff AND anything nearer than the cutoff
+/// (the chair, the desk), so the plugin can cut the picture out with
+/// real alpha instead of keying green.
 ///
 /// App target ONLY — deliberately absent from `LensLinkBroadcast.sources`
 /// (ios-app/project.yml is an explicit list), so the broadcast extension
@@ -41,11 +49,26 @@ final class FrameCompositor {
     /// the Live screen can show where it landed. Capture queue.
     var onAutoCutoff: ((Float) -> Void)?
 
+    /// Alpha-matte mode switch, read once per frame on the capture
+    /// queue (the plugin turns it on per connection). Set before the
+    /// compositor is wired to the camera.
+    var matteRequested: () -> Bool = { false }
+
+    /// Receives each MATTE payload with its frame's wire pts. Capture
+    /// queue; the receiver hops to the network queue itself.
+    var onMatte: ((Data, UInt64) -> Void)?
+
+    /// The matte is no wider than this: its inputs (the person mask,
+    /// ~256-512 wide, and the depth map, ~320 wide) carry no more
+    /// detail, and the plugin upsamples it to the frame.
+    static let matteMaxWidth = 960
+
     // MARK: - Members (all capture-queue confined after init)
 
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
+    private let mattePipeline: MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
     /// Metal validation requires every declared texture argument bound
     /// even when the kernel's runtime branch never samples it; this 1×1
@@ -80,6 +103,17 @@ final class FrameCompositor {
     private var autoMeasuredDepth: CVPixelBuffer?
     private var reportedAutoCutoff: Float = 0
 
+    /// The matte target: one buffer, reused — the pass waits for the
+    /// GPU and compresses before returning, so nothing else holds it.
+    private var matteBuffer: CVPixelBuffer?
+    /// Contiguous copy of the matte rows (the buffer's rows may be
+    /// padded) and the deflate output, both sized for the matte.
+    private var matteRows = Data()
+    private var matteCompressed = Data()
+    private let compressionScratch = UnsafeMutableRawPointer.allocate(
+        byteCount: max(1, compression_encode_scratch_buffer_size(COMPRESSION_ZLIB)),
+        alignment: 16)
+
     private var loggedStages = Set<String>()
     private var loggedMaskDims = false
 
@@ -102,6 +136,7 @@ final class FrameCompositor {
         let device: MTLDevice
         let queue: MTLCommandQueue
         let pipeline: MTLComputePipelineState
+        let mattePipeline: MTLComputePipelineState
     }
 
     private static let sharedMetal: SharedMetal? = {
@@ -118,12 +153,15 @@ final class FrameCompositor {
                 source: shaderSource, options: nil),
               let function = library.makeFunction(name: "greenScreenComposite"),
               let pipeline = try? metalDevice.makeComputePipelineState(
-                function: function) else {
+                function: function),
+              let matteFunction = library.makeFunction(name: "matteComposite"),
+              let mattePipeline = try? metalDevice.makeComputePipelineState(
+                function: matteFunction) else {
             print("FrameCompositor: shader compile failed — green screen disabled")
             return nil
         }
         return SharedMetal(device: metalDevice, queue: queue,
-                           pipeline: pipeline)
+                           pipeline: pipeline, mattePipeline: mattePipeline)
     }()
 
     init?(targetFps: Int32) {
@@ -158,9 +196,14 @@ final class FrameCompositor {
         self.device = metalDevice
         self.commandQueue = queue
         self.pipeline = pipeline
+        self.mattePipeline = shared.mattePipeline
         self.textureCache = cache
         self.dummyDepthTexture = dummy
         self.request = request
+    }
+
+    deinit {
+        compressionScratch.deallocate()
     }
 
     // MARK: - Depth
@@ -234,6 +277,21 @@ final class FrameCompositor {
            depth !== autoMeasuredDepth {
             autoMeasuredDepth = depth
             measureAutoCutoff(mask: maskBuffer, depth: depth)
+        }
+
+        // Alpha-matte mode: the picture stays untouched and the matte
+        // rides beside it. No matte (a failed pass) still sends the
+        // frame — the plugin then shows it opaque, never blank.
+        if let onMatte, matteRequested() {
+            if let payload = makeMatte(mask: maskBuffer, width: width,
+                                       height: height) {
+                // VideoEncoder's exact conversion, so the plugin pairs
+                // matte and frame by equal pts.
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                onMatte(payload,
+                        UInt64(max(0, CMTimeGetSeconds(pts)) * 1_000_000_000))
+            }
+            return sampleBuffer
         }
 
         // 2. Output buffer from our pool (rebuilt on dimension change).
@@ -324,23 +382,7 @@ final class FrameCompositor {
                                         planeIndex: 1, retaining: &retained)
         else { return false }
 
-        // Depth is optional per frame: no map yet, no cutoff configured,
-        // or a failed wrap all degrade to segmentation-only (gate = 1).
-        var depthTexture = dummyDepthTexture
-        var hasDepth: Float = 0
-        let cutoff = maxDistance < 0 ? autoCutoff : maxDistance
-        if cutoff > 0, let depthBuffer = latestDepthPixelBuffer {
-            if let wrappedDepth = makeTexture(from: depthBuffer,
-                                              pixelFormat: .r16Float,
-                                              planeIndex: 0,
-                                              retaining: &retained) {
-                depthTexture = wrappedDepth
-                hasDepth = 1
-            } else {
-                logOnce("depth-wrap",
-                        "FrameCompositor: depth texture wrap failed — segmentation-only")
-            }
-        }
+        let (depthTexture, depthParams) = depthInputs(retaining: &retained)
 
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -353,7 +395,7 @@ final class FrameCompositor {
         encoder.setTexture(depthTexture, index: 3)
         encoder.setTexture(outY, index: 4)
         encoder.setTexture(outCbCr, index: 5)
-        var params = SIMD2<Float>(cutoff, hasDepth)
+        var params = depthParams
         encoder.setBytes(&params, length: MemoryLayout<SIMD2<Float>>.size,
                          index: 0)
 
@@ -377,6 +419,124 @@ final class FrameCompositor {
         commandBuffer.waitUntilCompleted()
         withExtendedLifetime(retained) {}
         return commandBuffer.error == nil
+    }
+
+    /// The depth texture and kernel parameters (cutoff, hasDepth) for
+    /// this frame. Depth is optional per frame: no map yet, no cutoff
+    /// configured, or a failed wrap all degrade to segmentation-only.
+    private func depthInputs(retaining retained: inout [CVMetalTexture])
+        -> (MTLTexture, SIMD2<Float>) {
+        let cutoff = maxDistance < 0 ? autoCutoff : maxDistance
+        guard cutoff > 0, let depthBuffer = latestDepthPixelBuffer else {
+            return (dummyDepthTexture, SIMD2<Float>(cutoff, 0))
+        }
+        guard let wrappedDepth = makeTexture(from: depthBuffer,
+                                             pixelFormat: .r16Float,
+                                             planeIndex: 0,
+                                             retaining: &retained) else {
+            logOnce("depth-wrap",
+                    "FrameCompositor: depth texture wrap failed — segmentation-only")
+            return (dummyDepthTexture, SIMD2<Float>(cutoff, 0))
+        }
+        return (wrappedDepth, SIMD2<Float>(cutoff, 1))
+    }
+
+    // MARK: - Matte pass
+
+    /// Renders the matte (frame size divided down to at most
+    /// `matteMaxWidth` wide) and packs it as a MATTE payload:
+    /// width u16, height u16, encoding u8 (0 raw, 1 raw deflate),
+    /// reserved u8, then width×height bytes of alpha, row-major,
+    /// 255 = keep. nil when any stage fails (logged once).
+    private func makeMatte(mask: CVPixelBuffer, width: Int,
+                           height: Int) -> Data? {
+        let scale = max(1, (width + Self.matteMaxWidth - 1) / Self.matteMaxWidth)
+        let matteWidth = (width + scale - 1) / scale
+        let matteHeight = (height + scale - 1) / scale
+        if let existing = matteBuffer,
+           CVPixelBufferGetWidth(existing) != matteWidth
+            || CVPixelBufferGetHeight(existing) != matteHeight {
+            matteBuffer = nil
+        }
+        if matteBuffer == nil {
+            let attributes: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var created: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, matteWidth, matteHeight,
+                                kCVPixelFormatType_OneComponent8,
+                                attributes as CFDictionary, &created)
+            matteBuffer = created
+            matteRows = Data(count: matteWidth * matteHeight)
+            matteCompressed = Data(count: matteWidth * matteHeight)
+        }
+        guard let output = matteBuffer else {
+            logOnce("matte-buffer", "FrameCompositor: matte buffer creation failed")
+            return nil
+        }
+
+        var retained: [CVMetalTexture] = []
+        guard let maskTexture = makeTexture(from: mask, pixelFormat: .r8Unorm,
+                                            planeIndex: 0, retaining: &retained),
+              let outTexture = makeTexture(from: output, pixelFormat: .r8Unorm,
+                                           planeIndex: 0, retaining: &retained),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            logOnce("matte-metal", "FrameCompositor: matte pass setup failed")
+            return nil
+        }
+        let (depthTexture, depthParams) = depthInputs(retaining: &retained)
+        var params = depthParams
+        encoder.setComputePipelineState(mattePipeline)
+        encoder.setTexture(maskTexture, index: 0)
+        encoder.setTexture(depthTexture, index: 1)
+        encoder.setTexture(outTexture, index: 2)
+        encoder.setBytes(&params, length: MemoryLayout<SIMD2<Float>>.size,
+                         index: 0)
+        let threadsPerGroup = MTLSize(width: 16, height: 16, depth: 1)
+        let groups = MTLSize(width: (matteWidth + 15) / 16,
+                             height: (matteHeight + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(groups,
+                                     threadsPerThreadgroup: threadsPerGroup)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        withExtendedLifetime(retained) {}
+        guard commandBuffer.error == nil else {
+            logOnce("matte-gpu", "FrameCompositor: matte pass failed")
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(output, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(output) else { return nil }
+        let rowBytes = CVPixelBufferGetBytesPerRow(output)
+        let size = matteWidth * matteHeight
+        let compressedSize = matteRows.withUnsafeMutableBytes { rows -> Int in
+            let rowsBase = rows.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            for row in 0..<matteHeight {
+                memcpy(rowsBase + row * matteWidth, base + row * rowBytes,
+                       matteWidth)
+            }
+            return matteCompressed.withUnsafeMutableBytes { packed in
+                compression_encode_buffer(
+                    packed.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    size, rowsBase, size, compressionScratch, COMPRESSION_ZLIB)
+            }
+        }
+        // 0 means deflate could not beat raw within the buffer: send raw.
+        let deflated = compressedSize > 0
+        var payload = Data(capacity: 6 + (deflated ? compressedSize : size))
+        payload.append(UInt8(matteWidth >> 8))
+        payload.append(UInt8(matteWidth & 0xFF))
+        payload.append(UInt8(matteHeight >> 8))
+        payload.append(UInt8(matteHeight & 0xFF))
+        payload.append(deflated ? 1 : 0)
+        payload.append(0)
+        payload.append(deflated ? matteCompressed.prefix(compressedSize)
+                                : matteRows.prefix(size))
+        return payload
     }
 
     private func makeTexture(from buffer: CVPixelBuffer,
@@ -583,6 +743,63 @@ final class FrameCompositor {
         const float2 cbcr = srcCbCr.read(gid).rg;
         const float2 outC = mix(float2(GREEN_CB, GREEN_CR), cbcr, alphaMean);
         outCbCr.write(float4(outC, 0.0, 0.0), gid);
+    }
+
+    // Alpha matte, one thread per matte pixel. The person mask is kept
+    // inside the depth cutoff (as above), and anything nearer than the
+    // cutoff is kept even where the mask says no — the chair, the desk.
+    // That near test uses the FARTHEST of the 3x3 depth texels around
+    // the pixel, so the blurred depth edge around the subject never
+    // pulls the background in; a hole anywhere in the window gives the
+    // near test no opinion (the mask alone decides).
+    kernel void matteComposite(
+        texture2d<float, access::sample> mask  [[texture(0)]],
+        texture2d<float, access::sample> depth [[texture(1)]],
+        texture2d<float, access::write>  outA  [[texture(2)]],
+        constant Params &params [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]])
+    {
+        const uint w = outA.get_width();
+        const uint h = outA.get_height();
+        if (gid.x >= w || gid.y >= h)
+            return;
+
+        constexpr sampler bilinear(coord::normalized,
+                                   address::clamp_to_edge,
+                                   filter::linear);
+        constexpr sampler nearest(coord::normalized,
+                                  address::clamp_to_edge,
+                                  filter::nearest);
+
+        const float2 uv = (float2(gid) + 0.5) / float2(w, h);
+        float alpha = mask.sample(bilinear, uv).r;
+
+        if (params.hasDepth > 0.5 && params.maxDistance > 0.0) {
+            const float cut = params.maxDistance;
+            const float d = depth.sample(bilinear, uv).r;
+            if (!isnan(d))
+                alpha *= 1.0 - smoothstep(cut - DEPTH_FEATHER_M, cut, d);
+
+            const float2 texel =
+                1.0 / float2(depth.get_width(), depth.get_height());
+            float farthest = 0.0;
+            bool hole = false;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const float s = depth.sample(
+                        nearest, uv + float2(dx, dy) * texel).r;
+                    if (isnan(s) || s <= 0.0)
+                        hole = true;
+                    else
+                        farthest = max(farthest, s);
+                }
+            }
+            if (!hole)
+                alpha = max(alpha, 1.0 - smoothstep(
+                    cut - DEPTH_FEATHER_M, cut, farthest));
+        }
+
+        outA.write(float4(alpha), gid);
     }
     """
 }

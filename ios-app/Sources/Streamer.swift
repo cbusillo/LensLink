@@ -367,6 +367,10 @@ final class Streamer: ObservableObject {
         compositor?.onAutoCutoff = { [weak self] metres in
             Task { @MainActor in self?.greenScreenAutoCutoff = Double(metres) }
         }
+        compositor?.matteRequested = { [matte = greenScreenMatte] in matte.value }
+        compositor?.onMatte = { [client] payload, pts in
+            client.sendMatte(payload, ptsNanoseconds: pts)
+        }
         if let compositor {
             camera.onSampleBuffer = { [weak encoder, compositor,
                                        still = pausedStill,
@@ -1056,6 +1060,9 @@ final class Streamer: ObservableObject {
             if greenScreenMaxDistance != 0 {
                 state["greenScreenMaxDistance"] = greenScreenMaxDistance
             }
+            if greenScreenMatte.value {
+                state["greenScreenMatte"] = true
+            }
         }
         // Mic picker (docs/PROTOCOL.md §8): only while the phone mic is
         // live as the source's audio — remote UIs key their row off
@@ -1374,6 +1381,9 @@ final class Streamer: ObservableObject {
     /// stream runs uncomposited — the STATE snapshot stays honest by
     /// keying off this, not the setting.
     private var compositor: FrameCompositor?
+    /// Whether the connected plugin applies MATTE packets — the
+    /// capture queue reads it per frame.
+    private let greenScreenMatte = GreenScreenMatteCell()
     /// Bridges the main-actor `greenScreenMaxDistance` onto the capture
     /// queue, where the compositor's `maxDistance` is confined.
     private let greenScreenDistance = GreenScreenDistanceCell()
@@ -1840,6 +1850,14 @@ final class Streamer: ObservableObject {
                 greenScreenMaxDistance = distance < 0 ? Self.autoSubjectDistance
                     : distance == 0 ? 0 : min(max(distance, 0.5), 5.0)
             }
+            // A plugin that applies MATTE packets (this fork) asks for
+            // them on every connection; the compositor switches per
+            // frame, so no reconfigure. Cleared when the link drops.
+            if let matte = command["matte"] as? Bool,
+               matte != greenScreenMatte.value {
+                greenScreenMatte.value = matte
+                client.sendState(controlStateSnapshot())
+            }
         default:
             break
         }
@@ -2265,6 +2283,7 @@ final class Streamer: ObservableObject {
         // light at all, so any state but `connected` clears it; the plugin
         // re-announces on the next connection.
         if case .connected = state {} else {
+            greenScreenMatte.value = false
             tally = .off
             syncState = .off
             obsHost = nil
@@ -2365,6 +2384,25 @@ private final class GreenScreenDistanceCell {
     private var stored: Float = 0
 
     var value: Float {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+        set {
+            lock.lock()
+            stored = newValue
+            lock.unlock()
+        }
+    }
+}
+
+/// The same locked cell for the alpha-matte switch (network → capture queue).
+private final class GreenScreenMatteCell {
+    private let lock = NSLock()
+    private var stored = false
+
+    var value: Bool {
         get {
             lock.lock()
             defer { lock.unlock() }

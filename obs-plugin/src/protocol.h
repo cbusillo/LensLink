@@ -55,6 +55,12 @@ enum obsc_packet_type {
 	 * packet — CONTROL's mirror image (e.g. {"cmd":"recalibrate"}).
 	 * Unknown commands are ignored, so new ones stay compatible. */
 	OBSC_PKT_REQUEST = 12,
+	/* Alpha matte, app → plugin (this fork; matte.h). The green
+	 * screen's keep-mask for the VIDEO frame with the same pts, sent
+	 * only after we ask with green_screen matte:true. Payload: width
+	 * u16, height u16, encoding u8 (0 raw, 1 raw deflate), reserved u8,
+	 * then width*height alpha bytes. */
+	OBSC_PKT_MATTE = 13,
 };
 
 /* Reference-audio format (fixed). */

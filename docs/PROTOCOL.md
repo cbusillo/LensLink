@@ -281,6 +281,14 @@ is SDR-only: arming it forces the Standard colour pipeline, and the
 STATE fields below keep every surface honest about what's running.
 Camera connections only; screen mirror ignores it.
 
+`matte: true` (this fork) says the plugin applies alpha mattes (type 13).
+The plugin sends it on each VIDEO_CONFIG, since the app takes
+`green_screen` only while streaming; the app keeps it until the
+connection drops. While it holds and green screen is on, the app sends
+the frame untouched plus a MATTE packet instead of painting green, and
+STATE carries `"greenScreenMatte": true`. An app without the feature
+ignores the field.
+
 Unknown commands are ignored, so new ones can be added compatibly. The
 plugin's embedded web panel (http://localhost:9980) generates these.
 
@@ -442,6 +450,28 @@ and measure afresh (the app's sync pill tap; the web panel does the same
 thing via `POST /api/recalibrate`, no packet involved). Unknown commands
 are ignored, so new ones stay compatible; a plugin older than this type
 logs an unknown-type warning and carries on.
+
+### 13 — MATTE (app → plugin, this fork)
+
+The green screen's keep-mask for the VIDEO frame with the **same pts**,
+sent just before that frame's VIDEO packet and only after the plugin
+asked with `green_screen` `matte: true`. Payload:
+
+| Offset | Size | Field    | Notes                                         |
+|--------|------|----------|-----------------------------------------------|
+| 0      | 2    | width    | matte width, at most 960 (the frame divided down by a whole factor) |
+| 2      | 2    | height   | matte height                                   |
+| 4      | 1    | encoding | `0` raw, `1` raw deflate (RFC 1951, no zlib header) |
+| 5      | 1    | reserved | `0`                                            |
+| 6      | …    | alpha    | width × height bytes, row-major, 255 = keep    |
+
+The matte keeps the person mask inside the depth cutoff and anything
+nearer than the cutoff (chair, desk). The plugin upsamples it to the
+frame and outputs I420 + alpha; a frame whose matte was lost borrows the
+newest older one up to 70 ms old and is otherwise shown opaque. Mattes
+are dropped with the video under backpressure. An older plugin logs an
+unknown-type warning per packet, which is why the app sends them only
+when asked.
 
 ## Discovery (Bonjour)
 
