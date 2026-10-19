@@ -76,6 +76,15 @@ final class CameraManager: NSObject {
               _onDepthData = newValue }
     }
     private var _onDepthData: ((AVDepthData) -> Void)?
+    /// The same depth maps with their capture time, for the dataset
+    /// recorder (this fork). Capture queue.
+    var onTimedDepthData: ((AVDepthData, CMTime) -> Void)? {
+        get { callbackLock.lock(); defer { callbackLock.unlock() }
+              return _onTimedDepthData }
+        set { callbackLock.lock(); defer { callbackLock.unlock() }
+              _onTimedDepthData = newValue }
+    }
+    private var _onTimedDepthData: ((AVDepthData, CMTime) -> Void)?
     private var _onWhiteSample: ((CVPixelBuffer) -> Void)?
     private var whiteSampleID = 0
 
@@ -1579,6 +1588,7 @@ extension CameraManager: AVCaptureDataOutputSynchronizerDelegate {
         // the consumer keeps reusing the last map.
         if let syncedDepth, !syncedDepth.depthDataWasDropped {
             onDepthData?(syncedDepth.depthData)
+            onTimedDepthData?(syncedDepth.depthData, syncedDepth.timestamp)
         }
         guard let syncedVideo, !syncedVideo.sampleBufferWasDropped else {
             return

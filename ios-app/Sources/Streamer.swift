@@ -374,7 +374,17 @@ final class Streamer: ObservableObject {
         if let compositor {
             camera.onSampleBuffer = { [weak encoder, compositor,
                                        still = pausedStill,
-                                       gate = pauseGate] sampleBuffer in
+                                       gate = pauseGate,
+                                       recorder = datasetRecorder] sampleBuffer in
+                // A dataset take wants every frame at full rate: the
+                // cutout is bypassed while it records.
+                if recorder.isRecording {
+                    recorder.append(sampleBuffer)
+                    still.note(sampleBuffer)
+                    guard !gate.isPaused else { return }
+                    encoder?.encode(sampleBuffer)
+                    return
+                }
                 // Fail-open is the compositor's contract: any
                 // Vision/Metal failure returns the original buffer
                 // untouched; nil only on pool exhaustion — drop the
@@ -395,6 +405,10 @@ final class Streamer: ObservableObject {
                 compositor.maxDistance = distance.value
                 compositor.updateDepth(depth)
             }
+            camera.onTimedDepthData = { [recorder = datasetRecorder] depth, time in
+                recorder.append(depth: depth, ptsNanoseconds:
+                    UInt64(max(0, CMTimeGetSeconds(time)) * 1_000_000_000))
+            }
         } else {
             camera.onSampleBuffer = { [weak encoder,
                                        still = pausedStill,
@@ -408,6 +422,7 @@ final class Streamer: ObservableObject {
                 encoder?.encode(sampleBuffer)
             }
             camera.onDepthData = nil
+            camera.onTimedDepthData = nil
         }
     }
     @Published var codec: VideoCodec {
@@ -1384,6 +1399,8 @@ final class Streamer: ObservableObject {
     /// Whether the connected plugin applies MATTE packets — the
     /// capture queue reads it per frame.
     private let greenScreenMatte = GreenScreenMatteCell()
+    /// Offline test-set takes (this fork), driven by `record_dataset`.
+    private let datasetRecorder = DatasetRecorder()
     /// Bridges the main-actor `greenScreenMaxDistance` onto the capture
     /// queue, where the compositor's `maxDistance` is confined.
     private let greenScreenDistance = GreenScreenDistanceCell()
@@ -1835,6 +1852,17 @@ final class Streamer: ObservableObject {
                CameraManager.supports(resolution: resolution,
                                       fps: Int32(fps), lens: lens) {
                 selectedLens = lens
+            }
+        case "record_dataset":
+            // This fork: {"cmd":"record_dataset","seconds":60,"label":"…"}
+            // starts a take (green screen must be on, so depth runs);
+            // "stop": true ends one early.
+            if command["stop"] as? Bool == true {
+                datasetRecorder.stop()
+            } else if compositor != nil {
+                let seconds = (command["seconds"] as? NSNumber)?.doubleValue ?? 60
+                datasetRecorder.start(seconds: seconds,
+                                      label: command["label"] as? String ?? "")
             }
         case "green_screen":
             // Either field may arrive alone (docs/PROTOCOL.md §7). The
