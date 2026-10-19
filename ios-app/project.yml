@@ -76,14 +76,14 @@ targets:
         # lenslink://start / lenslink://stop — remote start via Shortcuts
         # automations (and anything else that can open a URL).
         CFBundleURLTypes:
-          - CFBundleURLName: com.exaltedpixels.LensLinkCamera
+          - CFBundleURLName: com.shinycomputers.LensLinkCamera
             CFBundleURLSchemes:
               - lenslink
     settings:
       base:
         # Explicit (not derived from bundleIdPrefix): com.exaltedpixels.LensLink
         # is registered to another Apple account, so it can't be used.
-        PRODUCT_BUNDLE_IDENTIFIER: com.exaltedpixels.LensLinkCamera
+        PRODUCT_BUNDLE_IDENTIFIER: com.shinycomputers.LensLinkCamera
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -97,7 +97,7 @@ targets:
         # 15, so it must be weak-linked or the app won't launch on iOS 15.
         OTHER_LDFLAGS: "-weak_framework AppIntents"
         # Set your Apple Developer team to run on a device:
-        # DEVELOPMENT_TEAM: XXXXXXXXXX
+        DEVELOPMENT_TEAM: MM5YXC7T6E
 
   # Screen mirroring: a ReplayKit broadcast-upload extension captures the
   # whole screen + system audio and streams it to the plugin over the same
@@ -129,7 +129,7 @@ targets:
     settings:
       base:
         # Must be a child of the app's bundle id.
-        PRODUCT_BUNDLE_IDENTIFIER: com.exaltedpixels.LensLinkCamera.broadcast
+        PRODUCT_BUNDLE_IDENTIFIER: com.shinycomputers.LensLinkCamera.broadcast
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
         CODE_SIGN_STYLE: Automatic
