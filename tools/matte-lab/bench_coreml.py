@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 path, runs = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 60
-for unit in ("CPU_AND_NE", "CPU_AND_GPU", "ALL"):
+for unit in (sys.argv[3].split(",") if len(sys.argv) > 3 else ("CPU_AND_NE", "CPU_AND_GPU", "ALL")):
     model = ct.models.MLModel(path, compute_units=getattr(ct.ComputeUnit, unit))
     spec = model.get_spec()
     feeds = {}
